@@ -12,12 +12,36 @@ def discounted_cumulative_sums(x, discount):
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 
-class Buffer:
+class Queue(object):
+    def __init__(self, size):
+        self.size = size
+        self.data_list = []
+
+    def push(self, data):
+        # print('ziaoang->data', type(data), data.shape)
+        assert len(self.data_list) <= self.size
+        self.data_list.append(data)
+        if len(self.data_list) > self.size:
+            self.data_list.pop(0)
+        return self._get()
+
+    def _get(self):
+        assert len(self.data_list) <= self.size
+        result = []
+        for i in range(self.size - len(self.data_list)):
+            result.append(np.zeros(self.data_list[0].shape[0]))
+        result.extend(self.data_list)
+        result = np.array(result)
+        result = np.expand_dims(result, 0)
+        return result
+
+
+class Buffer(object):
     # Buffer for storing trajectories
-    def __init__(self, observation_dimensions, size, gamma=0.99, lam=0.95):
+    def __init__(self, timestep, observation_dimensions, size, gamma=0.99, lam=0.95):
         # Buffer initialization
         self.observation_buffer = np.zeros(
-            (size, observation_dimensions), dtype=np.float32
+            (size, timestep, observation_dimensions), dtype=np.float32
         )
         self.action_buffer = np.zeros(size, dtype=np.int32)
         self.advantage_buffer = np.zeros(size, dtype=np.float32)
@@ -71,8 +95,9 @@ class Buffer:
         )
 
 
-def mlp(x, sizes, activation=tf.tanh, output_activation=None):
+def mlp(x, lstm_size, sizes, activation=tf.tanh, output_activation=None):
     # Build a feedforward neural network
+    x = layers.LSTM(lstm_size)(x)
     for size in sizes[:-1]:
         x = layers.Dense(units=size, activation=activation)(x)
     return layers.Dense(units=sizes[-1], activation=output_activation)(x)
@@ -156,15 +181,18 @@ env = gym.make("CartPole-v0")
 observation_dimensions = env.observation_space.shape[0]
 num_actions = env.action_space.n
 
+timestep = 8
+lstm_size = 64
+
 # Initialize the buffer
-buffer = Buffer(observation_dimensions, steps_per_epoch)
+buffer = Buffer(timestep, observation_dimensions, steps_per_epoch)
 
 # Initialize the actor and the critic as keras models
-observation_input = keras.Input(shape=(observation_dimensions,), dtype=tf.float32)
-logits = mlp(observation_input, list(hidden_sizes) + [num_actions], tf.tanh, None)
+observation_input = keras.Input(shape=(timestep, observation_dimensions), dtype=tf.float32)
+logits = mlp(observation_input, lstm_size, list(hidden_sizes) + [num_actions], tf.tanh, None)
 actor = keras.Model(inputs=observation_input, outputs=logits)
 value = tf.squeeze(
-    mlp(observation_input, list(hidden_sizes) + [1], tf.tanh, None), axis=1
+    mlp(observation_input, lstm_size, list(hidden_sizes) + [1], tf.tanh, None), axis=1
 )
 critic = keras.Model(inputs=observation_input, outputs=value)
 
@@ -177,7 +205,7 @@ value_optimizer = keras.optimizers.Adam(learning_rate=value_function_learning_ra
 
 # Initialize the observation, episode return and episode length
 observation, episode_return, episode_length = env.reset(), 0, 0
-
+observations = Queue(timestep)
 
 # Iterate over the number of epochs
 for epoch in range(epochs):
@@ -192,18 +220,23 @@ for epoch in range(epochs):
             env.render()
 
         # Get the logits, action, and take one step in the environment
-        observation = observation.reshape(1, -1)
-        logits, action = sample_action(observation)
+        # observation = observation.reshape(1, -1)
+
+        adv_observation = observations.push(observation)
+        # print('ziaoang->old size', observation.shape)
+        # print('ziaoang->new size', adv_observation.shape)
+
+        logits, action = sample_action(adv_observation)
         observation_new, reward, done, _ = env.step(action[0].numpy())
         episode_return += reward
         episode_length += 1
 
         # Get the value and log-probability of the action
-        value_t = critic(observation)
+        value_t = critic(adv_observation)
         logprobability_t = logprobabilities(logits, action)
 
         # Store obs, act, rew, v_t, logp_pi_t
-        buffer.store(observation, action, reward, value_t, logprobability_t)
+        buffer.store(adv_observation, action, reward, value_t, logprobability_t)
 
         # Update the observation
         observation = observation_new
@@ -211,12 +244,13 @@ for epoch in range(epochs):
         # Finish trajectory if reached to a terminal state
         terminal = done
         if terminal or (t == steps_per_epoch - 1):
-            last_value = 0 if done else critic(observation.reshape(1, -1))
+            last_value = 0 if done else critic(observations.push(observation))
             buffer.finish_trajectory(last_value)
             sum_return += episode_return
             sum_length += episode_length
             num_episodes += 1
             observation, episode_return, episode_length = env.reset(), 0, 0
+            observations = Queue(timestep)
 
     # Get values from the buffer
     (

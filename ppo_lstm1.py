@@ -190,6 +190,9 @@ value = tf.squeeze(
 )
 critic = keras.Model(inputs=[observation_input, critic_lstm_c_input, critic_lstm_h_input], outputs=[value, critic_lstm_c_output, critic_lstm_h_output])
 
+actor.summary()
+critic.summary()
+
 # Initialize the policy and the value function optimizers
 policy_optimizer = keras.optimizers.Adam(learning_rate=policy_learning_rate)
 value_optimizer = keras.optimizers.Adam(learning_rate=value_function_learning_rate)
